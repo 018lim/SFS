@@ -1,0 +1,19 @@
+# Environments
+.env
+venv/
+
+# Cache and logs
+__pycache__/
+docs_cache/
+krx_cache/
+scratch/
+sample/
+
+# Generated data files
+*.json
+*.csv
+*.png
+*.log
+
+# IDE
+.vscode/

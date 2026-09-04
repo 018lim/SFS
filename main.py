@@ -49,7 +49,7 @@ def format_money(value):
 
 def run_sfs_fundamental_pipeline():
     print("=" * 80)
-    print("🌟 SFS(Smart Factor Scoring) 펀더멘털 엔진 가동 시작 🌟")
+    print("🌟 SFS(Sequential Factor Screening) 펀더멘털 엔진 가동 시작 🌟")
     print("=" * 80)
 
     # ---------------------------------------------------------

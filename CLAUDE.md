@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-한국 주식(KOSPI) 대상 SFS(Smart Factor Scoring) 퀀트 랭킹 엔진. DART 공시와 KRX 시세를 모아 로컬 JSON DB를 만들고, 팩터 Z-스코어로 종목을 랭킹한다. 코드·주석·출력이 모두 한국어다.
+한국 주식(KOSPI) 대상 SFS(Sequential Factor Screening) 퀀트 랭킹 엔진. DART 공시와 KRX 시세를 모아 로컬 JSON DB를 만들고, 팩터 Z-스코어로 종목을 랭킹한다. 코드·주석·출력이 모두 한국어다.
 
 ## 실행
 

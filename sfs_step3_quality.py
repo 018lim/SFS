@@ -27,18 +27,30 @@ def calculate_quality_factors(target_tickers, rebalance_date):
         category = db.get('category', '일반기업')
         
         # --- [A] 동적 TTM 합산 헬퍼 함수 ---
+        # 네 분기 중 하나라도 값이 없으면(상장 전 등) None을 돌려준다. 없는 분기를 0으로
+        # 더하면 TTM이 과소 집계돼 점수만 조용히 왜곡된다.
         def ttm(key, qs_list):
             total = 0
             for y_str, q_str in qs_list:
-                total += db.get(y_str, {}).get(q_str, {}).get(key, 0)
+                v = db.get(y_str, {}).get(q_str, {}).get(key)
+                if v is None: return None
+                total += v
             return total
 
         # --- [B] 펀더멘털 데이터 추출 ---
         ttm_op = ttm('op', cur_qs)
         ttm_ni = ttm('ni', cur_qs)
-        ttm_ret_cur = ttm('return', cur_qs)
-        ttm_ret_prev = ttm('return', prev_qs)
-        
+        # 주주환원금 = 배당 + 자사주 취득 (DB에는 나눠서 저장하고 여기서 합산)
+        ttm_div_cur, ttm_bb_cur = ttm('dividend', cur_qs), ttm('buyback', cur_qs)
+        ttm_div_prev, ttm_bb_prev = ttm('dividend', prev_qs), ttm('buyback', prev_qs)
+
+        if any(v is None for v in (ttm_op, ttm_ni, ttm_div_cur, ttm_bb_cur, ttm_div_prev, ttm_bb_prev)):
+            print(f" ⚠️ [{tk}] TTM 구간에 없는 분기가 있어 건너뜁니다. (상장 전 등으로 보고서 미제출)")
+            continue
+
+        ttm_ret_cur = ttm_div_cur + ttm_bb_cur
+        ttm_ret_prev = ttm_div_prev + ttm_bb_prev
+
         try:
             assets_cur = db[curr_key[0]][curr_key[1]]['assets']
             assets_prev = db[prev_key[0]][prev_key[1]]['assets']

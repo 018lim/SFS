@@ -11,33 +11,52 @@ from sfs_krx_api import stock
 # ==========================================
 _DOC_CACHE = {}
 
+# 💡 [음수 캐시] "이 보고서는 DART에 없다"는 사실만 담는다. 표 데이터를 들고 있지 않아
+#    메모리 부담이 없으므로 종목이 바뀌어도 지우지 않는다. 백테스트는 리밸런싱 날짜마다
+#    전 종목을 다시 순회하는데, 상장 전이나 금융업 공백 구간처럼 영원히 없는 보고서를
+#    날짜마다 다시 묻던 것을 막는다.
+_EMPTY_DOCS = set()
+
 def clear_finstate_cache():
-    """종목 1개의 처리가 끝날 때마다 호출하여 메모리(RAM) 폭발을 방지합니다."""
+    """종목 1개의 처리가 끝날 때마다 호출하여 메모리(RAM) 폭발을 방지합니다.
+
+    부재 사실(_EMPTY_DOCS)은 유지한다 - 없는 보고서는 종목을 바꿔 돌아와도 여전히 없다.
+    """
     _DOC_CACHE.clear()
 
-def get_finstate_safe(dart, ticker, year, reprt_code):
+def get_finstate_safe(dart, ticker, year, reprt_code, fs_div='CFS'):
     """
-    [문서 중심 & 에러 방어 호출] 
+    [문서 중심 & 에러 방어 호출]
     1. 해당 분기 재무제표를 1번만 받아 캐시에 저장하고 재사용 (API 호출량 80% 감소)
-    2. CFS(연결)가 없으면 OFS(개별)로 자동 재시도 (013 에러 원천 차단)
+    2. 요청한 재무제표가 없으면 반대쪽(CFS<->OFS)으로 자동 재시도 (013 에러 원천 차단)
     3. DART 미등록 종목일 경우 깔끔하게 예외를 던져 프로그램 크래시 방지
+    fs_div: 'CFS'(연결) 기본, 주주환원(배당/자사주)은 'OFS'(개별)로 호출한다.
     """
-    cache_key = f"{ticker}_{year}_{reprt_code}"
-    
+    cache_key = f"{ticker}_{year}_{reprt_code}_{fs_div}"
+
     # 캐시에 이미 해당 문서가 있으면 API를 찌르지 않고 즉시 반환
     if cache_key in _DOC_CACHE:
         return _DOC_CACHE[cache_key]
-        
+
+    # 없다고 이미 확인한 보고서는 다시 묻지 않는다
+    doc_id = (ticker, year, reprt_code)
+    if doc_id in _EMPTY_DOCS:
+        return None
+
     try:
-        df = dart.finstate_all(ticker, year, reprt_code, 'CFS')
-        # 연결재무제표가 비어있으면 개별재무제표로 재시도
+        df = dart.finstate_all(ticker, year, reprt_code, fs_div)
+        # 요청한 재무제표가 비어있으면 반대쪽으로 재시도
         if df is None or df.empty:
-            df = dart.finstate_all(ticker, year, reprt_code, 'OFS')
-            
+            df = dart.finstate_all(ticker, year, reprt_code, 'OFS' if fs_div == 'CFS' else 'CFS')
+            # 양쪽 다 비면 그 보고서는 존재하지 않는다 (CFS/OFS 구분 없이 기억한다 -
+            # 그래야 CFS 요청과 OFS 요청이 같은 부재를 두 번 확인하지 않는다)
+            if df is None or df.empty:
+                _EMPTY_DOCS.add(doc_id)
+
     except ValueError as e:
         # "0126Z0" 등 DART에 없는 종목일 경우 바깥 루프로 에러를 던져 패스시킴
         if 'could not find' in str(e):
-            raise e 
+            raise e
         df = None
     except Exception:
         df = None
@@ -147,12 +166,14 @@ def save_local_db(db_data, file_path=None):
 # 💡 하드코딩된 dart.finstate_all 대신 get_finstate_safe 사용
 # ==========================================
 def get_stock_snapshot(dart, ticker, year, q, acc_type):
-    """재무상태표 스냅샷 추출 (Stock)"""
+    """재무상태표 스냅샷 추출 (Stock). 보고서 자체가 없으면 None."""
     report_map = {1: '11013', 2: '11012', 3: '11014', 4: '11011'}
-    
+
     # 💡 최적화된 안전 호출 함수 사용
     df = get_finstate_safe(dart, ticker, year, report_map[q])
-    if df is None or df.empty: return 0.0
+    # 보고서가 없는 것(상장 전 등)과 값이 0인 것은 다르다. 0을 돌려주면 그 0이
+    # 4분기 계산('연간 - Q1~Q3')에 그대로 들어가 없는 분기 실적이 4분기에 얹힌다.
+    if df is None or df.empty: return None
 
     df['clean_acc'] = df['account_nm'].astype(str).str.replace(' ', '')
     df['clean_sj'] = df['sj_nm'].astype(str).str.replace(' ', '')
@@ -172,16 +193,32 @@ def get_stock_snapshot(dart, ticker, year, q, acc_type):
     if not tgt.empty: return get_clean_value(tgt.iloc[0]['thstrm_amount'])
     return 0.0
 
-def extract_is_value(df, acc_type):
-    """손익계산서 3개월 단독 실적 추출 (OP, NI)"""
-    if df is None or df.empty: return 0.0
+def extract_is_value(df, acc_type, amount_col='thstrm_amount'):
+    """손익계산서 실적 추출 (OP, NI). 보고서 자체가 없으면 None.
+
+    amount_col='thstrm_add_amount'를 주면 당기누적(YTD)을 읽는다. 4분기를
+    '연간 - Q3누적'으로 구할 때 쓰며, 이러면 앞 분기 보고서가 없어도(연중 상장) 계산된다.
+    보고서는 있는데 해당 계정 행만 없는 경우는 0.0을 유지한다(실제로 0인 항목).
+    """
+    if df is None or df.empty: return None
     df['clean_acc'] = df['account_nm'].astype(str).str.replace(' ', '')
     df['clean_sj'] = df['sj_nm'].astype(str).str.replace(' ', '')
     
     tgt = pd.DataFrame()
     if acc_type == 'op':
-        if 'account_id' in df.columns: tgt = df[df['account_id'] == 'ifrs-full_OperatingProfitLoss']
-        if tgt.empty: tgt = df[(df['clean_sj'].str.contains('손익|포괄')) & (df['clean_acc'].isin(['영업이익', '영업이익(손실)', '영업손실']))]
+        if 'account_id' in df.columns:
+            tgt = df[df['account_id'].isin(['ifrs-full_OperatingProfitLoss',
+                                            'ifrs-full_ProfitLossFromOperatingActivities',
+                                            'dart_OperatingIncomeLoss'])]
+        if tgt.empty:
+            # 완전일치(isin)는 'Ⅳ.영업이익'처럼 번호가 붙은 표기를 놓친다(카카오뱅크 실측:
+            # account_nm='IV. 영업이익' -> 매칭 실패 -> 0.0으로 조용히 빠짐, 실제론 1,275억).
+            # '영업손익'(이익/손실 구분 없는 합성 표기, account_id='dart_OperatingIncomeLoss')을
+            # 쓰는 기업도 있다(실측: 064350·008770). '반영전'(충당금 반영 전 잠정치)·
+            # '신용'(신용손실충당금반영전영업이익)은 계속 제외한다.
+            tgt = df[(df['clean_sj'].str.contains('손익|포괄'))
+                     & (df['clean_acc'].str.contains('영업이익|영업손실|영업손익'))
+                     & (~df['clean_acc'].str.contains('반영전|신용'))]
         # 누적 배제 로직 추가 (모멘텀 무결성)
         if not tgt.empty and 'thstrm_nm' in tgt.columns:
             discrete_tgt = tgt[~tgt['thstrm_nm'].astype(str).str.contains('누적', na=False)]
@@ -196,12 +233,21 @@ def extract_is_value(df, acc_type):
             tgt = df[(df['clean_sj'].str.contains('손익|포괄')) & (df['clean_acc'].str.contains(profit_kw)) & (df['clean_acc'].str.contains('지배')) & (~df['clean_acc'].str.contains('포괄|비지배'))]
             if tgt.empty: tgt = df[(df['clean_sj'].str.contains('손익|포괄')) & (df['clean_acc'].str.contains(profit_kw)) & (~df['clean_acc'].str.contains('포괄|비지배|지분'))]
             
-    if not tgt.empty: return get_clean_value(tgt.iloc[0]['thstrm_amount'])
+    if not tgt.empty:
+        raw = tgt.iloc[0].get(amount_col)
+        # 누적 컬럼은 연간보고서 등에서 비어 있다. 빈 값을 0으로 읽으면
+        # '연간 - 누적'이 연간 전체가 되어 조용히 틀린다.
+        if raw is None or pd.isna(raw) or str(raw).strip() == '': return None
+        return get_clean_value(raw)
     return 0.0
 
 def extract_cf_ytd_value(df, acc_type):
-    """현금흐름표 누적(YTD) 실적 추출 (OCF, CAPEX, RETURN)"""
-    if df is None or df.empty: return 0.0
+    """현금흐름표 누적(YTD) 실적 추출 (ocf, capex, dividend, buyback). 보고서가 없으면 None.
+
+    주주환원금은 배당과 자사주를 따로 저장하고, 쓰는 쪽에서 합산한다.
+    보고서는 있는데 해당 계정 행만 없는 경우는 0.0을 유지한다(배당을 안 준 분기 등).
+    """
+    if df is None or df.empty: return None
     df['clean_acc'] = df['account_nm'].astype(str).str.replace(' ', '')
     df['clean_sj'] = df['sj_nm'].astype(str).str.replace(' ', '')
     df_cf = df[df['clean_sj'].str.contains('현금흐름')]
@@ -223,42 +269,73 @@ def extract_cf_ytd_value(df, acc_type):
         if not tgt_i.empty: cpx_i = abs(get_clean_value(tgt_i.iloc[0]['thstrm_amount']))
         return cpx_p + cpx_i
         
-    elif acc_type == 'return':
-        val_div, val_bb = 0.0, 0.0
-        tgt_d = df_cf[df_cf['account_id'].str.contains('DividendsPaid', na=False)] if 'account_id' in df_cf.columns else pd.DataFrame()
-        if tgt_d.empty: tgt_d = df_cf[df_cf['clean_acc'].str.contains('배당금') & df_cf['clean_acc'].str.contains('지급')]
-        if not tgt_d.empty: val_div = abs(get_clean_value(tgt_d.iloc[0]['thstrm_amount']))
-        
-        tgt_b = df_cf[df_cf['account_id'].str.contains('PaymentsForSharesRepurchased|PurchaseOfTreasuryShares', na=False)] if 'account_id' in df_cf.columns else pd.DataFrame()
-        if tgt_b.empty: tgt_b = df_cf[df_cf['clean_acc'].str.contains('자기주식') & df_cf['clean_acc'].str.contains('취득|매입')]
-        if not tgt_b.empty: val_bb = abs(get_clean_value(tgt_b.iloc[0]['thstrm_amount']))
-        return val_div + val_bb
-        
+    elif acc_type == 'dividend':
+        # 보통주 배당만. 신종자본증권/비지배지분 배당과 배당금 수취(영업활동 유입)는 제외한다.
+        # 표기가 '배당금의 지급'(신한)/'배당금의지급'(삼성)/'보통주 배당 지급'(KB)으로 갈려
+        # 표준계정코드를 1순위로 쓰고, 없을 때만 계정명으로 찾는다.
+        tgt = df_cf[df_cf['account_id'] == 'ifrs-full_DividendsPaidClassifiedAsFinancingActivities'] if 'account_id' in df_cf.columns else pd.DataFrame()
+        if tgt.empty:
+            tgt = df_cf[df_cf['clean_acc'].str.contains('배당') & df_cf['clean_acc'].str.contains('지급')
+                        & ~df_cf['clean_acc'].str.contains('신종|자본증권|비지배|수취|수입')]
+        return sum(abs(get_clean_value(v)) for v in tgt['thstrm_amount']) if not tgt.empty else 0.0
+
+    elif acc_type == 'buyback':
+        # 자기주식 취득. 기업마다 표준계정코드가 갈려 세 가지를 모두 본다.
+        buyback_ids = ['ifrs-full_PurchaseOfTreasuryShares',
+                       'ifrs-full_PaymentsToAcquireOrRedeemEntitysShares',
+                       'ifrs-full_PaymentsForSharesRepurchased']
+        tgt = df_cf[df_cf['account_id'].isin(buyback_ids)] if 'account_id' in df_cf.columns else pd.DataFrame()
+        if tgt.empty:
+            tgt = df_cf[df_cf['clean_acc'].str.contains('자기주식') & df_cf['clean_acc'].str.contains('취득|매입')
+                        & ~df_cf['clean_acc'].str.contains('처분|소각')]
+        return sum(abs(get_clean_value(v)) for v in tgt['thstrm_amount']) if not tgt.empty else 0.0
+
     return 0.0
 
 def get_discrete_is(dart, ticker, year, q, acc_type):
-    """[손익계산서 로직] 1~3분기는 단독 추출, 4분기는 연간에서 1~3분기 차감"""
+    """[손익계산서 로직] 1~3분기는 3개월 단독 추출, 4분기는 '연간 - Q3누적'.
+
+    4분기를 '연간 - (Q1+Q2+Q3)'로 구하면 세 분기 보고서가 모두 있어야 하고, 하나라도
+    없으면(연중 상장, 금융업 공백) 그 분기 실적이 통째로 4분기에 얹힌다. 3분기보고서의
+    당기누적(thstrm_add_amount)을 쓰면 연간·3분기 두 건만으로 정확히 구해진다.
+    (크래프톤 2021Q4: 6,396억 - 5,967억 = 429억. Q1이 없어도 계산된다.)
+    """
     report_map = {1: '11013', 2: '11012', 3: '11014'}
     if q in report_map:
         # 💡 최적화된 안전 호출 함수 사용
         return extract_is_value(get_finstate_safe(dart, ticker, year, report_map[q]), acc_type)
     elif q == 4:
-        # 💡 최적화된 안전 호출 함수 사용 (4분기는 캐싱 효과가 극대화됨)
         ann = extract_is_value(get_finstate_safe(dart, ticker, year, '11011'), acc_type)
-        q1 = extract_is_value(get_finstate_safe(dart, ticker, year, '11013'), acc_type)
-        q2 = extract_is_value(get_finstate_safe(dart, ticker, year, '11012'), acc_type)
-        q3 = extract_is_value(get_finstate_safe(dart, ticker, year, '11014'), acc_type)
-        return ann - (q1 + q2 + q3)
-    return 0.0
+        q3_cum = extract_is_value(get_finstate_safe(dart, ticker, year, '11014'),
+                                  acc_type, amount_col='thstrm_add_amount')
+        if ann is None or q3_cum is None: return None
+        return ann - q3_cum
+    return None
+
+def get_cf_ytd(dart, ticker, year, q, acc_type):
+    """현금흐름표 해당 분기까지의 누적(YTD) 값 하나만 뽑는다. 보고서가 없으면 None.
+
+    현금흐름표는 어느 분기든 그 보고서 자체가 이미 연초부터의 누적이라(손익계산서와
+    달리 '3개월 단독' 컬럼이 없다), 분기 단독값은 이 YTD들의 차로 만들어야 한다.
+    """
+    report_map = {1: '11013', 2: '11012', 3: '11014', 4: '11011'}
+    # 💡 주주환원(배당/자사주)은 개별(별도)재무제표 기준.
+    #    연결 현금흐름표의 배당금 지급액에는 종속회사가 지급한 배당이 섞여 과대계상된다.
+    #    (삼성전자 2024 반기: 연결 5.98조 vs 별도 4.90조)
+    fs_div = 'OFS' if acc_type in ('dividend', 'buyback') else 'CFS'
+    return extract_cf_ytd_value(get_finstate_safe(dart, ticker, year, report_map[q], fs_div), acc_type)
 
 def get_discrete_cf(dart, ticker, year, q, acc_type):
-    """[현금흐름표 로직] 무조건 YTD 추출 후 앞 분기 YTD 차감"""
-    report_map = {1: '11013', 2: '11012', 3: '11014', 4: '11011'}
-    # 💡 최적화된 안전 호출 함수 사용
-    def _ytd(y, rq): return extract_cf_ytd_value(get_finstate_safe(dart, ticker, y, report_map[rq]), acc_type)
-        
-    if q == 1: return _ytd(year, 1)
-    elif q == 2: return _ytd(year, 2) - _ytd(year, 1)
-    elif q == 3: return _ytd(year, 3) - _ytd(year, 2)
-    elif q == 4: return _ytd(year, 4) - _ytd(year, 3)
-    return 0.0
+    """[현금흐름표 로직] 무조건 YTD 추출 후 앞 분기 YTD 차감.
+
+    당분기든 직전 분기든 보고서가 없으면 None (차감의 한쪽이 없으면 계산이 성립하지 않는다).
+    중간 분기 하나가 API 공백이면(예: 금융업 2023Q1~Q2) 이 함수만으로는 Q3도 None이 된다 -
+    그럴 때는 sfs_step2_data_builder.discrete_cf가 이미 저장된 앞 분기 discrete 값으로 대신 구한다.
+    """
+    if q == 1: return get_cf_ytd(dart, ticker, year, 1, acc_type)
+    if q in (2, 3, 4):
+        cur = get_cf_ytd(dart, ticker, year, q, acc_type)
+        prev = get_cf_ytd(dart, ticker, year, q - 1, acc_type)
+        if cur is None or prev is None: return None
+        return cur - prev
+    return None

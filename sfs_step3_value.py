@@ -34,14 +34,28 @@ def calculate_value_factors(target_tickers, rebalance_date):
         category = db.get('category', '일반기업')
         
         total_ni, total_ocf, total_return = 0.0, 0.0, 0.0
-        
+        missing_quarter = False
+
         for y_str, q_str in cur_qs:
             # 💡 [수정] 불필요한 depth 확인 로직 제거
             q_data = db.get(y_str, {}).get(q_str, {})
-            total_ni += q_data.get('ni', 0)
-            total_ocf += q_data.get('ocf', 0)
-            total_return += q_data.get('return', 0)
-            
+            ni = q_data.get('ni')
+            dividend, buyback = q_data.get('dividend'), q_data.get('buyback')
+            # ocf는 PCR용이라 일반기업만 수집한다. 금융기업에 없는 건 정상이다
+            ocf = q_data.get('ocf') if category == '일반기업' else 0.0
+            # 값이 없는 분기(상장 전 등)를 0으로 더하면 TTM이 조용히 과소 집계된다
+            if any(v is None for v in (ni, dividend, buyback, ocf)):
+                missing_quarter = True
+                break
+            total_ni += ni
+            total_ocf += ocf
+            # 주주환원금 = 배당 + 자사주 취득 (DB에는 나눠서 저장하고 여기서 합산)
+            total_return += dividend + buyback
+
+        if missing_quarter:
+            print(f" ⚠️ [{tk}] TTM 구간에 없는 분기가 있어 건너뜁니다. (상장 전 등으로 보고서 미제출)")
+            continue
+
         latest_y, latest_q = cur_qs[0]
         try:
             total_equity = db[latest_y][latest_q]['equity']

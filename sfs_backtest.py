@@ -31,14 +31,18 @@ def get_first_business_day(year, month):
             continue
     return f"{year}{month:02d}01"
 
-def generate_rebalance_dates(start_year, end_year):
-    """지정된 기간 동안 매분기 마지막 달(3, 6, 9, 12월)의 첫 영업일 리스트를 생성합니다."""
+def generate_rebalance_dates(start_year, end_year, start_quarter=1):
+    """지정된 기간 동안 리밸런싱 날짜(4, 6, 9, 12월의 첫 영업일) 리스트를 생성합니다.
+
+    start_quarter: start_year의 몇 번째 리밸런싱 월부터 시작할지 (1=4월, 2=6월, 3=9월, 4=12월).
+    """
     dates = []
     months = [4, 6, 9, 12]
     today_str = datetime.now().strftime('%Y%m%d')
-    
+
     for y in range(start_year, end_year + 1):
-        for m in months:
+        y_months = months[start_quarter - 1:] if y == start_year else months
+        for m in y_months:
             date_str = get_first_business_day(y, m)
             if date_str <= today_str:
                 dates.append(date_str)
@@ -114,13 +118,13 @@ def calculate_metrics(returns_series, periods_per_year=4):
     
     return cagr, mdd, sharpe, cum_returns.iloc[-1]
 
-def run_backtest(start_year=2023, weight_method='equal'):
+def run_backtest(start_year=2023, weight_method='equal', start_quarter=1):
     print("=" * 80)
-    print(f"[SFS 백테스팅 엔진 가동] (시작: {start_year}년, 비중: {weight_method})")
+    print(f"[SFS 백테스팅 엔진 가동] (시작: {start_year}년 {start_quarter}번째 리밸런싱, 비중: {weight_method})")
     print("=" * 80)
-    
+
     current_year = int(datetime.now().strftime('%Y'))
-    rebalance_dates = generate_rebalance_dates(start_year, current_year)
+    rebalance_dates = generate_rebalance_dates(start_year, current_year, start_quarter)
     
     # 벤치마크(KOSPI) 데이터 가져오기
     has_kospi = False
@@ -314,6 +318,8 @@ if __name__ == "__main__":
     parser.add_argument('--weight', type=str, default='equal', choices=['equal', 'market_cap', 'z_score'],
                         help='포트폴리오 비중 방식 (equal, market_cap, z_score)')
     parser.add_argument('--start_year', type=int, default=2021, help='백테스트 시작 연도 (기본값: 2021)')
+    parser.add_argument('--start_quarter', type=int, default=1, choices=[1, 2, 3, 4],
+                        help='start_year의 몇 번째 리밸런싱 월부터 시작할지: 1=4월, 2=6월, 3=9월, 4=12월 (기본값: 1)')
     args = parser.parse_args()
-    
-    run_backtest(start_year=args.start_year, weight_method=args.weight)
+
+    run_backtest(start_year=args.start_year, weight_method=args.weight, start_quarter=args.start_quarter)

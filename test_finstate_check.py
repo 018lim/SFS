@@ -11,25 +11,41 @@ from bs4 import BeautifulSoup
 
 dart = OpenDartReader(os.getenv("DART_API_KEY"))
 
-def find_report_rcp(ticker, year, quarter):
+# 문서 조회용 세션 (연결 재사용 - 매 요청마다 새 소켓을 열지 않도록)
+SESSION = requests.Session()
+SESSION.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
+
+TICKER = '105560'
+FIRST_YQ, LAST_YQ = (2020, 1), (2023, 2)
+PERIODS = [(y, q) for y in range(FIRST_YQ[0], LAST_YQ[0] + 1) for q in (1, 2, 3, 4)
+           if FIRST_YQ <= (y, q) <= LAST_YQ]
+
+def load_reports(ticker):
+    """정기보고서 목록 1회 조회 (분기별 검색창을 모두 포함하는 범위)"""
+    return dart.list(ticker, start=f'{FIRST_YQ[0]}-01-01', end=f'{LAST_YQ[0]+1}-06-30',
+                     kind='A', final=False)
+
+def find_report_rcp(reports, year, quarter):
     month_map = {1: f'{year:04d}.03', 2: f'{year:04d}.06', 3: f'{year:04d}.09', 4: f'{year:04d}.12'}
+    # 접수일(rcept_dt) 기준 분기별 검색창 - 조회한 목록에서 분기별로 걸러 쓴다
     q_search = {
-        1: (f'{year}-04-01', f'{year}-07-31'),
-        2: (f'{year}-07-01', f'{year}-11-30'),
-        3: (f'{year}-10-01', f'{year+1}-01-31'),
-        4: (f'{year+1}-01-01', f'{year+1}-06-30'),
+        1: (f'{year}0401', f'{year}0731'),
+        2: (f'{year}0701', f'{year}1130'),
+        3: (f'{year}1001', f'{year+1}0131'),
+        4: (f'{year+1}0101', f'{year+1}0630'),
     }
     start, end = q_search[quarter]
     target_month = month_map[quarter]
-    reports = dart.list(ticker, start=start, end=end, kind='A', final=False)
     if reports is None or reports.empty: return None, None
+    reports = reports[(reports['rcept_dt'] >= start) & (reports['rcept_dt'] <= end)]
+    if reports.empty: return None, None
     matched = reports[reports['report_nm'].str.contains(target_month, na=False)]
     if not matched.empty:
         orig = matched[~matched['report_nm'].str.contains('기재정정')]
         if not orig.empty: return orig.iloc[0]['rcept_no'], orig.iloc[0]['report_nm']
         return matched.iloc[0]['rcept_no'], matched.iloc[0]['report_nm']
     q_name = {1: '1분기보고서', 2: '반기보고서', 3: '3분기보고서', 4: '사업보고서'}
-    matched = reports[reports['report_nm'].str.contains(q_name[quarter])]
+    matched = reports[reports['report_nm'].str.contains(q_name[quarter], na=False)]
     if not matched.empty: return matched.iloc[0]['rcept_no'], matched.iloc[0]['report_nm']
     return None, None
 
@@ -49,7 +65,7 @@ def find_sub_doc_urls(rcp_no):
     ]
     std_url = standalone.iloc[0]['url'] if not standalone.empty else None
     
-    return con_url, std_url, sub
+    return con_url, std_url
 
 def parse_amount(text):
     text = text.replace(',', '').replace(' ', '').replace('\xa0', '').strip()
@@ -62,14 +78,16 @@ def parse_amount(text):
     except: return None
 
 def first_valid_amount(cells):
+    """값이 들어있는 첫 번째 열(=당기)만 사용. 빈 셀은 레이아웃용이라 건너뛴다.
+    (뒤 열까지 훑으면 당기가 비었을 때 전기 값을 가져오게 된다)"""
     for cell in cells[1:]:
-        amt = parse_amount(cell.get_text(strip=True))
-        if amt is not None: return amt
+        text = cell.get_text(strip=True).replace('\xa0', '').strip()
+        if not text: continue
+        return parse_amount(text)
     return None
 
 def fetch_html(url):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    r = requests.get(url, headers=headers)
+    r = SESSION.get(url)
     r.encoding = 'utf-8'
     return BeautifulSoup(r.text, 'html.parser')
 
@@ -102,26 +120,29 @@ def parse_bs_is(soup):
     return result
 
 def parse_cf_return(soup):
-    """현금흐름표에서 배당금/자사주 파싱 (cells[1] 직접)"""
+    """개별(별도)재무제표 현금흐름표에서 배당금/자사주 파싱 (cells[1] 직접)"""
     dividend = 0.0
     buyback = 0.0
     for table in soup.find_all('table'):
         rows = table.find_all('tr')
         if len(rows) < 3: continue
+        # 현금흐름표만 대상 (자본변동표의 '자기주식의 취득' 중복 집계 방지)
+        if '재무활동' not in table.get_text().replace('\xa0','').replace(' ',''): continue
         for row in rows:
             cells = row.find_all(['td', 'th'])
             if len(cells) < 2: continue
             label = cells[0].get_text(strip=True).replace('\xa0','').replace(' ','').replace('\u3000','')
             cell1_amt = parse_amount(cells[1].get_text(strip=True))
+            if cell1_amt is None: continue
             
-            # 배당: '배당' + '지급' 포함, '신종' 제외
-            if '배당' in label and '지급' in label and '신종' not in label:
-                if cell1_amt is not None:
-                    dividend += cell1_amt
-            # 자기주식 취득: '자기주식' + '취득' 포함, '처분'/'소각' 제외
-            elif '자기주식' in label and '취득' in label and '처분' not in label and '소각' not in label:
-                if cell1_amt is not None:
-                    buyback += cell1_amt
+            # 배당: 표준 계정과목 '배당금의 지급' / '배당금 지급'
+            #       신종자본증권 배당, 비지배지분 배당, 배당금 수취는 제외
+            if ('배당금의지급' in label or '배당금지급' in label) and \
+                    not any(x in label for x in ('신종', '자본증권', '비지배', '수취', '수입')):
+                dividend += cell1_amt
+            # 자사주: 표준 계정과목 '자기주식의 취득' ('자기주식취득' 표기도 허용)
+            elif '자기주식' in label and '취득' in label:
+                buyback += cell1_amt
     return dividend, buyback
 
 def fmt(v):
@@ -132,51 +153,43 @@ def fmt(v):
 # STEP 1: YTD 데이터 수집
 # ============================================================
 print("=" * 170)
-print("[STEP 1] KB금융(105560) 2020~2023Q2 - YTD 원본 (연결BS/IS + 별도CF)")
+print(f"[STEP 1] KB금융({TICKER}) {FIRST_YQ[0]}Q{FIRST_YQ[1]}~{LAST_YQ[0]}Q{LAST_YQ[1]} - YTD 원본 (연결BS/IS + 별도CF)")
 print("=" * 170)
 print(f"{'기간':>8} | {'자산총계':>15} | {'부채총계':>15} | {'자본총계':>15} | {'OP(YTD)':>12} | {'NI(YTD)':>12} | {'지배NI(YTD)':>12} | {'배당(YTD)':>12} | {'자사주(YTD)':>12} | {'별도CF':>6}")
 print("-" * 170)
 
 ytd_data = {}
-for year in [2020, 2021, 2022, 2023]:
-    ytd_data[year] = {}
-    quarters = [1, 2, 3, 4] if year < 2023 else [1, 2]
-    for q in quarters:
-        try:
-            rcp_no, rname = find_report_rcp('105560', year, q)
-            if rcp_no is None:
-                print(f"  {year}Q{q} | 보고서 없음"); time.sleep(0.5); continue
-            
-            time.sleep(0.5)
-            con_url, std_url, sub = find_sub_doc_urls(rcp_no)
-            
-            # 연결재무제표 파싱 (BS/IS)
-            d = {}
-            if con_url:
-                time.sleep(0.3)
-                soup_con = fetch_html(con_url)
-                d = parse_bs_is(soup_con)
-                # 연결재무제표에서도 CF 시도
-                div_con, buy_con = parse_cf_return(soup_con)
-                d['dividend'] = div_con
-                d['buyback'] = buy_con
-            
-            # 별도 재무제표에서 CF 파싱 (배당/자사주가 0이면)
-            std_used = "N"
-            if std_url and d.get('dividend', 0) == 0 and d.get('buyback', 0) == 0:
-                time.sleep(0.3)
-                soup_std = fetch_html(std_url)
-                div_std, buy_std = parse_cf_return(soup_std)
-                if div_std != 0 or buy_std != 0:
-                    d['dividend'] = div_std
-                    d['buyback'] = buy_std
-                    std_used = "Y"
-            
-            ytd_data[year][q] = d
-            print(f"  {year}Q{q} | {fmt(d.get('assets')):>15} | {fmt(d.get('liabilities')):>15} | {fmt(d.get('equity')):>15} | {fmt(d.get('op')):>12} | {fmt(d.get('ni')):>12} | {fmt(d.get('ni_parent')):>12} | {fmt(d.get('dividend',0)):>12} | {fmt(d.get('buyback',0)):>12} | {std_used:>6}")
-        except Exception as e:
-            print(f"  {year}Q{q} | 에러: {str(e)[:70]}")
-        time.sleep(0.5)
+reports = load_reports(TICKER)
+for year, q in PERIODS:
+    try:
+        rcp_no, _ = find_report_rcp(reports, year, q)
+        if rcp_no is None:
+            print(f"  {year}Q{q} | 보고서 없음"); continue
+        
+        con_url, std_url = find_sub_doc_urls(rcp_no)
+        
+        # 연결재무제표 파싱 (BS/IS)
+        d = {}
+        if con_url:
+            time.sleep(0.3)
+            soup_con = fetch_html(con_url)
+            d = parse_bs_is(soup_con)
+        d['dividend'] = 0.0
+        d['buyback'] = 0.0
+        
+        # 배당/자사주는 개별(별도) 재무제표 현금흐름표에서 파싱
+        std_used = "N"
+        if std_url:
+            time.sleep(0.3)
+            soup_std = fetch_html(std_url)
+            d['dividend'], d['buyback'] = parse_cf_return(soup_std)
+            std_used = "Y"
+        
+        ytd_data[(year, q)] = d
+        print(f"  {year}Q{q} | {fmt(d.get('assets')):>15} | {fmt(d.get('liabilities')):>15} | {fmt(d.get('equity')):>15} | {fmt(d.get('op')):>12} | {fmt(d.get('ni')):>12} | {fmt(d.get('ni_parent')):>12} | {fmt(d['dividend']):>12} | {fmt(d['buyback']):>12} | {std_used:>6}")
+    except Exception as e:
+        print(f"  {year}Q{q} | 에러: {str(e)[:70]}")
+    time.sleep(0.3)
 
 # ============================================================
 # STEP 2: YTD → 분기(discrete) 변환
@@ -189,25 +202,22 @@ print("-" * 170)
 
 flow_keys = ['op', 'ni', 'ni_parent', 'dividend', 'buyback']
 
-for year in [2020, 2021, 2022, 2023]:
-    quarters = [1, 2, 3, 4] if year < 2023 else [1, 2]
-    for q in quarters:
-        if q not in ytd_data.get(year, {}): continue
-        d = ytd_data[year][q]
-        disc = {}
-        disc['assets'] = d.get('assets')
-        disc['liabilities'] = d.get('liabilities')
-        disc['equity'] = d.get('equity')
-        
-        for key in flow_keys:
-            ytd_val = d.get(key, 0) or 0
-            if q == 1:
-                disc[key] = ytd_val
-            else:
-                prev_ytd = ytd_data.get(year, {}).get(q-1, {}).get(key, 0) or 0
-                disc[key] = ytd_val - prev_ytd
-        
-        ret = (disc.get('dividend') or 0) + (disc.get('buyback') or 0)
-        print(f"  {year}Q{q} | {fmt(disc['assets']):>15} | {fmt(disc['liabilities']):>15} | {fmt(disc['equity']):>15} | {fmt(disc.get('op')):>12} | {fmt(disc.get('ni')):>12} | {fmt(disc.get('ni_parent')):>12} | {fmt(disc.get('dividend')):>12} | {fmt(disc.get('buyback')):>12} | {fmt(ret):>12}")
+for year, q in PERIODS:
+    d = ytd_data.get((year, q))
+    if d is None: continue
+    prev = ytd_data.get((year, q-1))
+    disc = {key: d.get(key) for key in ['assets', 'liabilities', 'equity']}
+    
+    for key in flow_keys:
+        ytd_val = d.get(key) or 0
+        if q == 1:
+            disc[key] = ytd_val
+        elif prev is None:
+            disc[key] = None  # 직전 분기 데이터가 없으면 분기 환산 불가 (0으로 두면 YTD가 그대로 찍힘)
+        else:
+            disc[key] = ytd_val - (prev.get(key) or 0)
+    
+    ret = None if disc['dividend'] is None or disc['buyback'] is None else disc['dividend'] + disc['buyback']
+    print(f"  {year}Q{q} | {fmt(disc['assets']):>15} | {fmt(disc['liabilities']):>15} | {fmt(disc['equity']):>15} | {fmt(disc['op']):>12} | {fmt(disc['ni']):>12} | {fmt(disc['ni_parent']):>12} | {fmt(disc['dividend']):>12} | {fmt(disc['buyback']):>12} | {fmt(ret):>12}")
 
 print("\n[DONE]")

@@ -1,0 +1,11 @@
+pandas==3.0.5
+numpy==2.5.2
+scipy==1.18.1
+OpenDartReader==0.2.2
+pykrx==1.2.8
+requests==2.34.2
+beautifulsoup4==4.15.0
+tqdm==4.70.0
+matplotlib==3.11.1
+yfinance==1.6.0
+python-dotenv==1.2.3

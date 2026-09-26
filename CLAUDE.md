@@ -24,7 +24,7 @@ venv\Scripts\python.exe test_finstate_check.py                   # 원문 파싱
 
 테스트 프레임워크는 없다. 검증은 위 단독 실행 스크립트의 출력을 눈으로 확인하는 방식이고, 파싱 로직을 고쳤다면 변경 전후 출력을 파일로 저장해 diff하는 것이 유일한 회귀 확인 수단이다. `scratch/`는 gitignore 대상이라 일회성 검증 스크립트를 두기 좋다. DB를 건드리는 수정을 검증할 때는 `S.DB_FILE_PATH`를 `scratch/` 아래 임시 경로로 바꿔서 운영 DB를 보존할 것.
 
-`requirements.txt`가 없다. venv에 pandas / numpy / scipy / OpenDartReader / pykrx / requests / beautifulsoup4 / tqdm / matplotlib / yfinance / python-dotenv가 설치돼 있다. `.env`에는 `DART_API_KEY`, `KRX_API_KEY`가 필요하다.
+`requirements.txt`에 의존성이 실제 venv 버전으로 고정돼 있다(pandas / numpy / scipy / OpenDartReader / pykrx / requests / beautifulsoup4 / tqdm / matplotlib / yfinance / python-dotenv). 패키지를 추가·업그레이드하면 함께 갱신할 것. `README.md`(포트폴리오용 소개·백테스트 결과)와 `LICENSE`(MIT)도 있다. `sfs_backtest_result.png`는 `*.png` 무시 규칙의 예외로 커밋된다. `.env`에는 `DART_API_KEY`, `KRX_API_KEY`가 필요하다.
 
 ## 파이프라인
 

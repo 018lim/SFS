@@ -11,6 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```
 venv\Scripts\python.exe main.py                                  # 전체 파이프라인 → Top 10 출력
 venv\Scripts\python.exe sfs_backtest.py --start_year 2021 --start_quarter 1 --weight equal
+venv\Scripts\python.exe sfs_backtest.py --start_year 2022 --weight market_cap --max_weight 0.1
 venv\Scripts\python.exe sfs_verify_yfinance.py                   # sfs_trades_log.csv를 yfinance 수정주가로 교차검증
 venv\Scripts\python.exe sfs_step1_universe.py                    # 각 sfs_step*.py는 __main__ 블록으로 단독 실행 가능
 venv\Scripts\python.exe check_finance_data.py                    # 지정 종목·기간의 분기 데이터를 표로 조회 (운영 DB 안 건드림)
@@ -18,13 +19,15 @@ venv\Scripts\python.exe sfs_dart_html.py                         # 공시원문 
 venv\Scripts\python.exe test_finstate_check.py                   # 원문 파싱 검증 스크립트 (KB금융, 자체 파서 사본 보유)
 ```
 
-`sfs_backtest.py`의 `--start_quarter`(1~4, 기본 1)는 `start_year`의 몇 번째 리밸런싱 월(4·6·9·12월)부터 시작할지 지정한다. `--start_year`만으로는 항상 그 해 4월부터 시작하며, 첫 리밸런싱의 기준분기는 전년도 Q4로 잡힌다(달력 분기와 다름, `get_latest_available_quarter` 참고). 다만 12분기 수집 창이 해마다 전년도까지 자연스럽게 닿으므로, 과거 분기를 담으려고 `start_year`를 낮출 필요는 보통 없다.
+`sfs_backtest.py`의 `--start_quarter`(1~4, 기본 1)는 `start_year`의 몇 번째 리밸런싱 월(4·6·9·12월)부터 시작할지 지정한다. `--start_year`만으로는 항상 그 해 4월부터 시작하며, 첫 리밸런싱의 기준분기는 전년도 Q4로 잡힌다(달력 분기와 다름, `get_latest_available_quarter` 참고). 다만 12분기 수집 창이 해마다 전년도까지 자연스럽게 닿으므로, 과거 분기를 담으려고 `start_year`를 낮출 필요는 보통 없다. `--max_weight`(예: `0.1`)는 종목별 비중 상한이다. 상한 초과분은 걸리지 않은 종목에 기존 비중 비례로 재배분하고(전액 투자 유지), 재배분으로 새로 상한을 넘으면 수렴할 때까지 반복한다. 옵션을 주지 않으면 상한 없이 기존과 동일하게 동작한다.
+
+백테스트 한 번은 리밸런싱 날짜마다 step1~7을 처음부터 다시 돌기 때문에 2022년 시작(18구간) 기준 30~40분이 걸린다. **병목은 계산이 아니라 I/O 대기**다(생존 종목 100여 개마다 14개월치 일별 시세를 하루씩 조립하는 `get_historical_prices`). 이미 돌린 결과를 다른 각도로 분석할 때는 재실행하지 말고 `sfs_trades_log.csv`(종목·비중·매수가·구간)와 `krx_cache/`로 일간 자산 곡선을 복원할 것 — 백테스트의 구간 내 평가 루프를 그대로 재현하면 누적 수익률이 소수점까지 일치한다.
 
 `check_finance_data.py`가 데이터 확인용 주력 도구다. 상단의 `TICKERS`/`FIRST_YQ`/`LAST_YQ`만 고치면 임의 종목·기간을 조회할 수 있고, step2의 수집 로직(API 우선 → 금융업 공백은 원문 대체)을 그대로 재사용하되 결과를 로컬 딕셔너리에만 담아 `raw_finance_data.json`에는 쓰지 않는다.
 
-테스트 프레임워크는 없다. 검증은 위 단독 실행 스크립트의 출력을 눈으로 확인하는 방식이고, 파싱 로직을 고쳤다면 변경 전후 출력을 파일로 저장해 diff하는 것이 유일한 회귀 확인 수단이다. `scratch/`는 gitignore 대상이라 일회성 검증 스크립트를 두기 좋다. DB를 건드리는 수정을 검증할 때는 `S.DB_FILE_PATH`를 `scratch/` 아래 임시 경로로 바꿔서 운영 DB를 보존할 것.
+테스트 프레임워크는 없다. 검증은 위 단독 실행 스크립트의 출력을 눈으로 확인하는 방식이고, 파싱 로직을 고쳤다면 변경 전후 출력을 파일로 저장해 diff하는 것이 유일한 회귀 확인 수단이다. `scratch/`는 gitignore 대상이라 일회성 검증 스크립트를 두기 좋다. DB를 건드리는 수정을 검증할 때는 운영 DB 사본을 만들고 `sfs_utils.DB_FILE_PATH`와 `sfs_step2_data_builder.DB_FILE_PATH`를 **둘 다** 그 경로로 덮어쓸 것 — 두 모듈이 각각 `from sfs_config import DB_FILE_PATH`로 값을 복사해 가므로 `sfs_config`만 고쳐서는 적용되지 않는다. 참고로 과거 리밸런싱 날짜로 돌리면 `src='na'` 레코드가 그 시점 기준 최신 2분기에 걸려 재확인되므로, 원문에서 값을 찾으면 `src`가 `'html'`로 바뀐다(금액 변화 없음, 설계된 동작).
 
-`requirements.txt`에 의존성이 실제 venv 버전으로 고정돼 있다(pandas / numpy / scipy / OpenDartReader / pykrx / requests / beautifulsoup4 / tqdm / matplotlib / yfinance / python-dotenv). 패키지를 추가·업그레이드하면 함께 갱신할 것. `README.md`(포트폴리오용 소개·백테스트 결과)와 `LICENSE`(MIT)도 있다. `sfs_backtest_result.png`는 `*.png` 무시 규칙의 예외로 커밋된다. `.env`에는 `DART_API_KEY`, `KRX_API_KEY`가 필요하다.
+`requirements.txt`에 의존성이 실제 venv 버전으로 고정돼 있다(pandas / numpy / scipy / OpenDartReader / pykrx / requests / beautifulsoup4 / tqdm / matplotlib / yfinance / python-dotenv). 패키지를 추가·업그레이드하면 함께 갱신할 것. `README.md`(포트폴리오용 소개·백테스트 결과)와 `LICENSE`(MIT)도 있다. README가 참조하는 차트 세 장(`sfs_backtest_result.png`, `sfs_factor_ratio_comparison.png`, `sfs_weight_comparison.png`)은 `*.png` 무시 규칙의 예외로 커밋된다. 뒤의 두 장은 `sfs_backtest.py`가 직접 만들지 않고 별도 분석으로 그린 것이다. `.env`에는 `DART_API_KEY`, `KRX_API_KEY`가 필요하다.
 
 ## 파이프라인
 
@@ -101,6 +104,7 @@ Tier는 순회 순번이 아니라 연도 기준으로 정한다. `tier1_start_y
   2. 신종자본증권 배당과 비지배지분 배당은 상장사 주주 몫이 아니므로 **제외**한다.
   3. 표준계정코드를 1순위로 쓰고(자사주는 `PurchaseOfTreasuryShares` / `PaymentsToAcquireOrRedeemEntitysShares` / `PaymentsForSharesRepurchased` 세 가지), 없을 때만 계정명으로 찾는다. 표기가 `배당금의 지급`(신한)/`배당금의지급`(삼성)/`보통주 배당 지급`(KB)으로 갈리기 때문이다. 매칭 행은 **전부 합산**하고 부호는 양수로 저장한다(소비부가 양수를 전제).
 - **센티널 값**: PER/PBR의 `9999.0`은 적자 또는 결측을 뜻한다. 모멘텀 Z-스코어 결측은 `-0.5` 페널티로 채운다.
+- **가중치마다 영향 범위가 다르다**: `WEIGHTS['Factors']`(펀더멘털:모멘텀)는 **step7의 최종 랭킹에만** 쓰인다. step4·step6의 컷오프에는 관여하지 않으므로 이 값을 바꿔도 생존 종목군은 그대로이고 그 안에서 뽑는 상위 20종목만 달라진다. 반면 `Fundamental_Sections`/`Momentum_Sections`와 `Indicators`의 가중치는 step4·step6에서 컷오프 점수를 직접 만들기 때문에, 바꾸면 **생존 종목 자체가 달라진다.** 그래서 팩터 비중 민감도는 파이프라인을 한 번만 돌리고 `Final_Fund_Z`/`Final_Mom_Z`를 재가중해 구할 수 있지만, 섹션·지표 가중치는 조합마다 전체를 다시 돌려야 한다.
 
 ## 주의할 부작용
 

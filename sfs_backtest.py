@@ -81,7 +81,31 @@ def run_sfs_for_date(target_date):
     df_final = pd.merge(df_final, df_universe[['종목코드', '종가', '시가총액']], on='종목코드', how='left')
     return df_final.head(20).copy()
 
-def calculate_weights(df, method='equal'):
+def apply_weight_cap(weights, cap):
+    """종목별 비중 상한을 적용합니다.
+
+    상한 초과분은 걸리지 않은 종목에 기존 비중 비례로 재배분하고, 재배분 때문에
+    새로 상한을 넘는 종목이 생기면 수렴할 때까지 반복합니다.
+    """
+    w = weights.astype(float).copy()
+    # 상한을 지키면서 100%를 채울 수 없으면(종목 수 x 상한 <= 1) 동일가중이 유일한 해다.
+    # 이 경우를 걸러내지 않으면 재배분이 두 상태를 오가며 수렴하지 않는다.
+    if cap * len(w) <= 1.0:
+        return pd.Series(1.0 / len(w), index=w.index)
+    for _ in range(100):
+        over = w > cap + 1e-12
+        if not over.any():
+            break
+        excess = (w[over] - cap).sum()
+        w[over] = cap
+        under = ~over
+        base = w[under].sum()
+        if base <= 0:  # 위 가드가 있어 도달하지 않지만, 0으로 나눠 NaN이 조용히 퍼지는 것을 막는다
+            break
+        w[under] = w[under] + excess * w[under] / base
+    return w / w.sum()
+
+def calculate_weights(df, method='equal', max_weight=None):
     """선택된 방식에 따라 포트폴리오 비중을 계산합니다."""
     if method == 'equal':
         df['Weight'] = 1.0 / len(df)
@@ -95,6 +119,9 @@ def calculate_weights(df, method='equal'):
         df['Weight'] = adjusted_z / adjusted_z.sum()
     else:
         df['Weight'] = 1.0 / len(df)
+
+    if max_weight is not None:
+        df['Weight'] = apply_weight_cap(df['Weight'], max_weight)
     return df
 
 def calculate_metrics(returns_series, periods_per_year=4):
@@ -118,9 +145,10 @@ def calculate_metrics(returns_series, periods_per_year=4):
     
     return cagr, mdd, sharpe, cum_returns.iloc[-1]
 
-def run_backtest(start_year=2023, weight_method='equal', start_quarter=1):
+def run_backtest(start_year=2023, weight_method='equal', start_quarter=1, max_weight=None):
+    cap_str = f", 종목별 상한: {max_weight*100:.0f}%" if max_weight is not None else ""
     print("=" * 80)
-    print(f"[SFS 백테스팅 엔진 가동] (시작: {start_year}년 {start_quarter}번째 리밸런싱, 비중: {weight_method})")
+    print(f"[SFS 백테스팅 엔진 가동] (시작: {start_year}년 {start_quarter}번째 리밸런싱, 비중: {weight_method}{cap_str})")
     print("=" * 80)
 
     current_year = int(datetime.now().strftime('%Y'))
@@ -169,7 +197,7 @@ def run_backtest(start_year=2023, weight_method='equal', start_quarter=1):
             z_score = row.get('Grand_Total_Z', 0)
             print(f" {rank}위: {tk_name} ({row['종목코드']}) - Z스코어: {z_score:.2f}")
             
-        df_port = calculate_weights(df_port, weight_method)
+        df_port = calculate_weights(df_port, weight_method, max_weight)
         next_date = rebalance_dates[i+1] if i+1 < len(rebalance_dates) else datetime.now().strftime('%Y%m%d')
         
         print(f"[{t_date} -> {next_date}] 일간 수익률 평가 중 (차트 세밀도 향상)...")
@@ -320,6 +348,9 @@ if __name__ == "__main__":
     parser.add_argument('--start_year', type=int, default=2021, help='백테스트 시작 연도 (기본값: 2021)')
     parser.add_argument('--start_quarter', type=int, default=1, choices=[1, 2, 3, 4],
                         help='start_year의 몇 번째 리밸런싱 월부터 시작할지: 1=4월, 2=6월, 3=9월, 4=12월 (기본값: 1)')
+    parser.add_argument('--max_weight', type=float, default=None,
+                        help='종목별 비중 상한 (예: 0.1 = 10%%). 기본값: 상한 없음')
     args = parser.parse_args()
 
-    run_backtest(start_year=args.start_year, weight_method=args.weight, start_quarter=args.start_quarter)
+    run_backtest(start_year=args.start_year, weight_method=args.weight,
+                 start_quarter=args.start_quarter, max_weight=args.max_weight)

@@ -15,6 +15,7 @@ sample/
 *.png
 *.log
 !sfs_backtest_result.png
+!sfs_factor_ratio_comparison.png
 
 # IDE
 .vscode/
